@@ -2,7 +2,6 @@ package com.github.rzo1.twitter.v2.streams;
 
 
 import com.github.rzo1.twitter.v2.streams.exception.TwitterServiceException;
-import com.github.rzo1.twitter.v2.streams.exception.TwitterDisconnectException;
 import com.twitter.clientlib.ApiException;
 import com.twitter.clientlib.api.TwitterApi;
 import com.twitter.clientlib.model.ConnectionExceptionProblem;
@@ -60,11 +59,16 @@ public class TweetsStreamListenersExecutor {
         this.isRunning.set(true);
         this.watch = new CountDownLatch(asyncWorkers + 1);
         startDispatcher();
-        startQueuer();
+        startQueuer(1);
     }
 
-    private void startQueuer() {
-        futures.add(executorService.submit(new TweetsQueuer(twitterApi, connectionRetries)));
+    private void startQueuer(int currentConnectionAttempt) {
+        if (currentConnectionAttempt <= connectionRetries) {
+            currentConnectionAttempt++;
+        } else {
+            currentConnectionAttempt = 1;
+        }
+        futures.add(executorService.submit(new TweetsQueuer(twitterApi, connectionRetries, currentConnectionAttempt)));
     }
 
     private void startDispatcher() {
@@ -162,9 +166,12 @@ public class TweetsStreamListenersExecutor {
         private final TwitterApi client;
         private final int retries;
 
-        public TweetsQueuer(TwitterApi client, int connectionRetries) {
+        private final int currentConnectionAttempt;
+
+        public TweetsQueuer(TwitterApi client, int connectionRetries, int currentConnectionAttempt) {
             this.client = client;
             this.retries = connectionRetries;
+            this.currentConnectionAttempt = currentConnectionAttempt;
         }
 
         @Override
@@ -173,9 +180,10 @@ public class TweetsStreamListenersExecutor {
         }
 
         private void queueTweets() {
+            boolean needsReconnect = false;
             String line;
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(connect()))) {
-                while (isRunning.get()) {
+                while (isRunning.get() && !needsReconnect) {
                     line = reader.readLine();
                     if (line == null || line.isBlank()) {
                         innerLogger.debug("Waiting to receive a tweet...");
@@ -185,36 +193,40 @@ public class TweetsStreamListenersExecutor {
                     innerLogger.debug("Queuing a tweet...");
                     final StreamingTweetResponse str = StreamingTweetResponse.fromJson(line);
 
-                    // https://github.com/twitterdev/twitter-api-java-sdk/issues/37
-                    if (str.getErrors() != null) {
-                        for (Problem problem : str.getErrors()) {
-                            if (problem instanceof OperationalDisconnectProblem || problem instanceof ConnectionExceptionProblem) {
-                                logger.warn("Experiencing a disconnect: {}. Trying to re-connect!", problem);
-                                //force a re-connect
-                                throw new TwitterDisconnectException(problem.getDetail());
-                            }
-                        }
-                    }
+                    needsReconnect = hasReconnectErrors(str);
 
-                    tweetsQueue.put(str);
+                    if (!needsReconnect) {
+                        tweetsQueue.put(str);
+                    }
                 }
             } catch (Exception e) {
                 innerLogger.warn(e.getLocalizedMessage(), e);
                 innerLogger.warn("Lost connection to the Twitter API v2 endpoint due to an unexpected error. Try to reconnect...");
-                if (e instanceof TwitterServiceException) {
-                    try {
-                        int waitingTimeInMs = 15 * 1000;
-                        innerLogger.debug("Twitter API V2: Waiting {} seconds before trying to reconnect.", waitingTimeInMs / 1000);
-                        Thread.sleep(waitingTimeInMs);
-                    } catch (InterruptedException ex) {
-                        Thread.currentThread().interrupt();
-                    }
-                }
-                startQueuer();
+                needsReconnect = true;
             }
+
+            if (needsReconnect) {
+                // Wait a bit before starting the TweetsQueuer and calling the API again.
+                sleep(5 * 1000L * currentConnectionAttempt);
+                startQueuer(currentConnectionAttempt);
+            }
+
             watch.countDown();
         }
 
+        private boolean hasReconnectErrors(StreamingTweetResponse str) {
+            // https://github.com/twitterdev/twitter-api-java-sdk/issues/37
+            if (str.getErrors() != null) {
+                for (Problem problem : str.getErrors()) {
+                    if (problem instanceof OperationalDisconnectProblem || problem instanceof ConnectionExceptionProblem) {
+                        logger.warn("Experiencing a disconnect: {}. Trying to re-connect!", problem);
+                        //force a re-connect
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
 
         private InputStream getConnection() throws ApiException {
             return client.tweets().searchStream()
@@ -265,15 +277,19 @@ public class TweetsStreamListenersExecutor {
                             }
                         }
                     }
-                    try {
-                        innerLogger.debug("Twitter API V2: Waiting {} seconds before trying to reconnect.", waitingTimeInMs / 1000);
-                        Thread.sleep(waitingTimeInMs);
-                    } catch (InterruptedException ex) {
-                        Thread.currentThread().interrupt();
-                    }
+                    sleep(waitingTimeInMs);
                 }
             }
             throw new TwitterServiceException("Could not connect to Twitter API V2");
+        }
+
+        private void sleep(long millis) {
+            try {
+                innerLogger.debug("Twitter API V2: Waiting {} seconds before trying to reconnect.", millis / 1000);
+                Thread.sleep(millis);
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 }

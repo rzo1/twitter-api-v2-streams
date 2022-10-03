@@ -17,7 +17,7 @@
         <java.target>17</java.target>
 
         <!-- other 3rd party library settings -->
-        <twitter.sdk.version>2.0.2</twitter.sdk.version>
+        <twitter.sdk.version>2.0.3</twitter.sdk.version>
         <picocli.version>4.6.3</picocli.version>
 
         <!-- additional dependencies -->

@@ -19,6 +19,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Partly copied from <a href="https://github.com/twitterdev/twitter-api-java-sdk/blob/main/examples/src/main/java/com/twitter/clientlib/TweetsStreamListenersExecutor.java">https://github.com/twitterdev/twitter-api-java-sdk/blob/main/examples/src/main/java/com/twitter/clientlib/TweetsStreamListenersExecutor.java</a>
@@ -26,6 +27,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class TweetsStreamListenersExecutor {
 
     private static final org.slf4j.Logger logger = org.slf4j.LoggerFactory.getLogger(TweetsStreamListenersExecutor.class);
+    private final static long TIMEOUT_MILLIS = 60000;
+    private final static long SLEEP_MILLIS = 100;
+    private final static long BACKOFF_SLEEP_INTERVAL_MILLIS = 5000;
     private final TweetsQueue tweetsQueue = new LinkedBlockingTweetQueue(20000);
     private final List<TweetsStreamListener> listeners = new ArrayList<>();
     private final int asyncWorkers;
@@ -33,6 +37,7 @@ public class TweetsStreamListenersExecutor {
     private final TwitterApi twitterApi;
     private final ExecutorService executorService;
     private final AtomicBoolean isRunning = new AtomicBoolean(true);
+    private final AtomicLong tweetStreamedTime = new AtomicLong(0);
     private final List<Future<?>> futures;
     private CountDownLatch watch;
 
@@ -60,6 +65,14 @@ public class TweetsStreamListenersExecutor {
         this.watch = new CountDownLatch(asyncWorkers + 1);
         startDispatcher();
         startQueuer(1);
+    }
+
+    private void resetTweetStreamedTime() {
+        tweetStreamedTime.set(System.currentTimeMillis());
+    }
+
+    private boolean isTweetStreamStale() {
+        return System.currentTimeMillis() - tweetStreamedTime.get() > TIMEOUT_MILLIS;
     }
 
     private void startQueuer(int currentConnectionAttempt) {
@@ -165,7 +178,6 @@ public class TweetsStreamListenersExecutor {
         private static final org.slf4j.Logger innerLogger = org.slf4j.LoggerFactory.getLogger(TweetsQueuer.class);
         private final TwitterApi client;
         private final int retries;
-
         private final int currentConnectionAttempt;
 
         public TweetsQueuer(TwitterApi client, int connectionRetries, int currentConnectionAttempt) {
@@ -187,9 +199,14 @@ public class TweetsStreamListenersExecutor {
                     line = reader.readLine();
                     if (line == null || line.isBlank()) {
                         innerLogger.debug("Waiting to receive a tweet...");
-                        Thread.sleep(100);
+                        Thread.sleep(SLEEP_MILLIS);
+                        if (isTweetStreamStale()) {
+                            innerLogger.debug("We did not receive a new tweet for {} ms. Stream might be stale. Trigger a reconnect.", TIMEOUT_MILLIS);
+                            needsReconnect = true;
+                        }
                         continue;
                     }
+                    resetTweetStreamedTime(); // we received a tweet, we can reset the timer now...
                     innerLogger.debug("Queuing a tweet...");
                     final StreamingTweetResponse str = StreamingTweetResponse.fromJson(line);
 
@@ -207,7 +224,7 @@ public class TweetsStreamListenersExecutor {
 
             if (needsReconnect) {
                 // Wait a bit before starting the TweetsQueuer and calling the API again.
-                sleep(5 * 1000L * currentConnectionAttempt);
+                sleep(BACKOFF_SLEEP_INTERVAL_MILLIS * currentConnectionAttempt);
                 startQueuer(currentConnectionAttempt);
             }
 
